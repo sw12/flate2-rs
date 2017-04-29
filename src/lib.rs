@@ -84,7 +84,6 @@ pub use crc::{Crc, CrcReader};
 
 mod bufreader;
 mod crc;
-mod deflate;
 mod ffi;
 mod gz;
 mod zio;
