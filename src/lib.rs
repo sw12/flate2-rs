@@ -89,47 +89,10 @@ mod ffi;
 mod gz;
 mod zio;
 mod mem;
-mod zlib;
 
-/// Types which operate over [`Read`] streams, both encoders and decoders for
-/// various formats.
-///
-/// [`Read`]: https://doc.rust-lang.org/std/io/trait.Read.html
-pub mod read {
-    pub use deflate::EncoderReader as DeflateEncoder;
-    pub use deflate::DecoderReader as DeflateDecoder;
-    pub use zlib::EncoderReader as ZlibEncoder;
-    pub use zlib::DecoderReader as ZlibDecoder;
-    pub use gz::EncoderReader as GzEncoder;
-    pub use gz::DecoderReader as GzDecoder;
-    pub use gz::MultiDecoderReader as MultiGzDecoder;
-}
-
-/// Types which operate over [`Write`] streams, both encoders and decoders for
-/// various formats.
-///
-/// [`Write`]: https://doc.rust-lang.org/std/io/trait.Write.html
-pub mod write {
-    pub use deflate::EncoderWriter as DeflateEncoder;
-    pub use deflate::DecoderWriter as DeflateDecoder;
-    pub use zlib::EncoderWriter as ZlibEncoder;
-    pub use zlib::DecoderWriter as ZlibDecoder;
-    pub use gz::EncoderWriter as GzEncoder;
-}
-
-/// Types which operate over [`BufRead`] streams, both encoders and decoders for
-/// various formats.
-///
-/// [`BufRead`]: https://doc.rust-lang.org/std/io/trait.BufRead.html
-pub mod bufread {
-    pub use deflate::EncoderReaderBuf as DeflateEncoder;
-    pub use deflate::DecoderReaderBuf as DeflateDecoder;
-    pub use zlib::EncoderReaderBuf as ZlibEncoder;
-    pub use zlib::DecoderReaderBuf as ZlibDecoder;
-    pub use gz::EncoderReaderBuf as GzEncoder;
-    pub use gz::DecoderReaderBuf as GzDecoder;
-    pub use gz::MultiDecoderReaderBuf as MultiGzDecoder;
-}
+pub mod read;
+pub mod write;
+pub mod bufread;
 
 fn _assert_send_sync() {
     fn _assert_send_sync<T: Send + Sync>() {}
