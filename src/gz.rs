@@ -2,12 +2,10 @@
 //!
 //! [1]: http://www.gzip.org/zlib/rfc-gzip.html
 
-use std::cmp;
 use std::env;
 use std::ffi::CString;
 use std::io::prelude::*;
 use std::io;
-use std::mem;
 use std::time;
 
 #[cfg(feature = "tokio")]
@@ -16,56 +14,17 @@ use futures::Poll;
 use tokio_io::{AsyncRead, AsyncWrite};
 
 use {Compression, Compress};
+use read;
+use bufread;
+use write;
+use zio;
 use bufreader::BufReader;
 use crc::{CrcReader, Crc};
-use deflate;
-use zio;
 
 static FHCRC: u8 = 1 << 1;
 static FEXTRA: u8 = 1 << 2;
 static FNAME: u8 = 1 << 3;
 static FCOMMENT: u8 = 1 << 4;
-
-/// A gzip streaming encoder
-///
-/// This structure exposes a [`Write`] interface that will emit compressed data
-/// to the underlying writer `W`.
-///
-/// [`Write`]: https://doc.rust-lang.org/std/io/trait.Write.html
-#[derive(Debug)]
-pub struct EncoderWriter<W: Write> {
-    inner: zio::Writer<W, Compress>,
-    crc: Crc,
-    crc_bytes_written: usize,
-    header: Vec<u8>,
-}
-
-/// A gzip streaming encoder
-///
-/// This structure exposes a [`Read`] interface that will read uncompressed data
-/// from the underlying reader and expose the compressed version as a [`Read`]
-/// interface.
-///
-/// [`Read`]: https://doc.rust-lang.org/std/io/trait.Read.html
-#[derive(Debug)]
-pub struct EncoderReader<R> {
-    inner: EncoderReaderBuf<BufReader<R>>,
-}
-
-/// A gzip streaming encoder
-///
-/// This structure exposes a [`Read`] interface that will read uncompressed data
-/// from the underlying reader and expose the compressed version as a [`Read`]
-/// interface.
-///
-/// [`Read`]: https://doc.rust-lang.org/std/io/trait.Read.html
-#[derive(Debug)]
-pub struct EncoderReaderBuf<R> {
-    inner: deflate::EncoderReaderBuf<CrcReader<R>>,
-    header: Vec<u8>,
-    pos: usize,
-    eof: bool,
-}
 
 /// A builder structure to create a new gzip Encoder.
 ///
@@ -76,68 +35,6 @@ pub struct Builder {
     filename: Option<CString>,
     comment: Option<CString>,
     mtime: u32,
-}
-
-/// A gzip streaming decoder
-///
-/// This structure exposes a [`Read`] interface that will consume compressed
-/// data from the underlying reader and emit uncompressed data.
-///
-/// [`Read`]: https://doc.rust-lang.org/std/io/trait.Read.html
-#[derive(Debug)]
-pub struct DecoderReader<R> {
-    inner: DecoderReaderBuf<BufReader<R>>,
-}
-
-/// A gzip streaming decoder that decodes all members of a multistream
-///
-/// A gzip member consists of a header, compressed data and a trailer. The [gzip
-/// specification](https://tools.ietf.org/html/rfc1952), however, allows multiple
-/// gzip members to be joined in a single stream.  `MultiDecoderReader` will
-/// decode all consecutive members while `DecoderReader` will only decompress the
-/// first gzip member. The multistream format is commonly used in bioinformatics,
-/// for example when using the BGZF compressed data.
-///
-/// This structure exposes a [`Read`] interface that will consume all gzip members
-/// from the underlying reader and emit uncompressed data.
-///
-/// [`Read`]: https://doc.rust-lang.org/std/io/trait.Read.html
-#[derive(Debug)]
-pub struct MultiDecoderReader<R> {
-    inner: MultiDecoderReaderBuf<BufReader<R>>,
-}
-
-/// A gzip streaming decoder
-///
-/// This structure exposes a [`Read`] interface that will consume compressed
-/// data from the underlying reader and emit uncompressed data.
-///
-/// [`Read`]: https://doc.rust-lang.org/std/io/trait.Read.html
-#[derive(Debug)]
-pub struct DecoderReaderBuf<R> {
-    inner: CrcReader<deflate::DecoderReaderBuf<R>>,
-    header: Header,
-    finished: bool,
-}
-
-/// A gzip streaming decoder that decodes all members of a multistream
-///
-/// A gzip member consists of a header, compressed data and a trailer. The [gzip
-/// specification](https://tools.ietf.org/html/rfc1952), however, allows multiple
-/// gzip members to be joined in a single stream. `MultiDecoderReaderBuf` will
-/// decode all consecutive members while `DecoderReaderBuf` will only decompress
-/// the first gzip member. The multistream format is commonly used in
-/// bioinformatics, for example when using the BGZF compressed data.
-///
-/// This structure exposes a [`Read`] interface that will consume all gzip members
-/// from the underlying reader and emit uncompressed data.
-///
-/// [`Read`]: https://doc.rust-lang.org/std/io/trait.Read.html
-#[derive(Debug)]
-pub struct MultiDecoderReaderBuf<R> {
-    inner: CrcReader<deflate::DecoderReaderBuf<R>>,
-    header: Header,
-    finished: bool,
 }
 
 /// A structure representing the header of a gzip stream.
@@ -199,8 +96,8 @@ impl Builder {
     ///
     /// The data written to the returned encoder will be compressed and then
     /// written out to the supplied parameter `w`.
-    pub fn write<W: Write>(self, w: W, lvl: Compression) -> EncoderWriter<W> {
-        EncoderWriter {
+    pub fn write<W: Write>(self, w: W, lvl: Compression) -> write::GzEncoder<W> {
+        write::GzEncoder {
             inner: zio::Writer::new(w, Compress::new(lvl, false)),
             crc: Crc::new(),
             header: self.into_header(lvl),
@@ -212,8 +109,8 @@ impl Builder {
     ///
     /// Data read from the returned encoder will be the compressed version of
     /// the data read from the given reader.
-    pub fn read<R: Read>(self, r: R, lvl: Compression) -> EncoderReader<R> {
-        EncoderReader {
+    pub fn read<R: Read>(self, r: R, lvl: Compression) -> read::GzEncoder<R> {
+        read::GzEncoder {
             inner: self.buf_read(BufReader::new(r), lvl),
         }
     }
@@ -222,12 +119,12 @@ impl Builder {
     ///
     /// Data read from the returned encoder will be the compressed version of
     /// the data read from the given reader.
-    pub fn buf_read<R>(self, r: R, lvl: Compression) -> EncoderReaderBuf<R>
+    pub fn buf_read<R>(self, r: R, lvl: Compression) -> bufread::GzEncoder<R>
         where R: BufRead,
     {
         let crc = CrcReader::new(r);
-        EncoderReaderBuf {
-            inner: deflate::EncoderReaderBuf::new(crc, lvl),
+        bufread::GzEncoder {
+            inner: bufread::DeflateEncoder::new(crc, lvl),
             header: self.into_header(lvl),
             pos: 0,
             eof: false,
@@ -284,607 +181,6 @@ impl Builder {
     }
 }
 
-impl<W: Write> EncoderWriter<W> {
-    /// Creates a new encoder which will use the given compression level.
-    ///
-    /// The encoder is not configured specially for the emitted header. For
-    /// header configuration, see the `Builder` type.
-    ///
-    /// The data written to the returned encoder will be compressed and then
-    /// written to the stream `w`.
-    pub fn new(w: W, level: Compression) -> EncoderWriter<W> {
-        Builder::new().write(w, level)
-    }
-
-    /// Acquires a reference to the underlying writer.
-    pub fn get_ref(&self) -> &W {
-        self.inner.get_ref()
-    }
-
-    /// Acquires a mutable reference to the underlying writer.
-    ///
-    /// Note that mutation of the writer may result in surprising results if
-    /// this encoder is continued to be used.
-    pub fn get_mut(&mut self) -> &mut W {
-        self.inner.get_mut()
-    }
-
-    /// Attempt to finish this output stream, writing out final chunks of data.
-    ///
-    /// Note that this function can only be used once data has finished being
-    /// written to the output stream. After this function is called then further
-    /// calls to `write` may result in a panic.
-    ///
-    /// # Panics
-    ///
-    /// Attempts to write data to this stream may result in a panic after this
-    /// function is called.
-    ///
-    /// # Errors
-    ///
-    /// This function will perform I/O to complete this stream, and any I/O
-    /// errors which occur will be returned from this function.
-    pub fn try_finish(&mut self) -> io::Result<()> {
-        try!(self.write_header());
-        try!(self.inner.finish());
-
-        while self.crc_bytes_written < 8 {
-            let (sum, amt) = (self.crc.sum() as u32, self.crc.amount());
-            let buf = [(sum >> 0) as u8,
-                       (sum >> 8) as u8,
-                       (sum >> 16) as u8,
-                       (sum >> 24) as u8,
-                       (amt >> 0) as u8,
-                       (amt >> 8) as u8,
-                       (amt >> 16) as u8,
-                       (amt >> 24) as u8];
-            let mut inner = self.inner.get_mut();
-            let n = try!(inner.write(&buf[self.crc_bytes_written..]));
-            self.crc_bytes_written += n;
-        }
-        Ok(())
-    }
-
-    /// Finish encoding this stream, returning the underlying writer once the
-    /// encoding is done.
-    ///
-    /// Note that this function may not be suitable to call in a situation where
-    /// the underlying stream is an asynchronous I/O stream. To finish a stream
-    /// the `try_finish` (or `shutdown`) method should be used instead. To
-    /// re-acquire ownership of a stream it is safe to call this method after
-    /// `try_finish` or `shutdown` has returned `Ok`.
-    ///
-    /// # Errors
-    ///
-    /// This function will perform I/O to complete this stream, and any I/O
-    /// errors which occur will be returned from this function.
-    pub fn finish(mut self) -> io::Result<W> {
-        try!(self.try_finish());
-        Ok(self.inner.take_inner())
-    }
-
-    fn write_header(&mut self) -> io::Result<()> {
-        while self.header.len() > 0 {
-            let n = try!(self.inner.get_mut().write(&self.header));
-            self.header.drain(..n);
-        }
-        Ok(())
-    }
-}
-
-impl<W: Write> Write for EncoderWriter<W> {
-    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        assert_eq!(self.crc_bytes_written, 0);
-        try!(self.write_header());
-        let n = try!(self.inner.write(buf));
-        self.crc.update(&buf[..n]);
-        Ok(n)
-    }
-
-    fn flush(&mut self) -> io::Result<()> {
-        assert_eq!(self.crc_bytes_written, 0);
-        self.inner.flush()
-    }
-}
-
-#[cfg(feature = "tokio")]
-impl<W: AsyncWrite> AsyncWrite for EncoderWriter<W> {
-    fn shutdown(&mut self) -> Poll<(), io::Error> {
-        try_nb!(self.try_finish());
-        self.get_mut().shutdown()
-    }
-}
-
-impl<R: Read + Write> Read for EncoderWriter<R> {
-    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        self.get_mut().read(buf)
-    }
-}
-
-#[cfg(feature = "tokio")]
-impl<R: AsyncRead + AsyncWrite> AsyncRead for EncoderWriter<R> {
-}
-
-impl<W: Write> Drop for EncoderWriter<W> {
-    fn drop(&mut self) {
-        if self.inner.is_present() {
-            let _ = self.try_finish();
-        }
-    }
-}
-
-impl<R: Read> EncoderReader<R> {
-    /// Creates a new encoder which will use the given compression level.
-    ///
-    /// The encoder is not configured specially for the emitted header. For
-    /// header configuration, see the `Builder` type.
-    ///
-    /// The data read from the stream `r` will be compressed and available
-    /// through the returned reader.
-    pub fn new(r: R, level: Compression) -> EncoderReader<R> {
-        Builder::new().read(r, level)
-    }
-}
-
-impl<R> EncoderReader<R> {
-    /// Acquires a reference to the underlying reader.
-    pub fn get_ref(&self) -> &R {
-        self.inner.get_ref().get_ref()
-    }
-
-    /// Acquires a mutable reference to the underlying reader.
-    ///
-    /// Note that mutation of the reader may result in surprising results if
-    /// this encoder is continued to be used.
-    pub fn get_mut(&mut self) -> &mut R {
-        self.inner.get_mut().get_mut()
-    }
-
-    /// Returns the underlying stream, consuming this encoder
-    pub fn into_inner(self) -> R {
-        self.inner.into_inner().into_inner()
-    }
-}
-
-fn copy(into: &mut [u8], from: &[u8], pos: &mut usize) -> usize {
-    let min = cmp::min(into.len(), from.len() - *pos);
-    for (slot, val) in into.iter_mut().zip(from[*pos..*pos + min].iter()) {
-        *slot = *val;
-    }
-    *pos += min;
-    return min;
-}
-
-impl<R: Read> Read for EncoderReader<R> {
-    fn read(&mut self, mut into: &mut [u8]) -> io::Result<usize> {
-        self.inner.read(into)
-    }
-}
-
-impl<R: Read + Write> Write for EncoderReader<R> {
-    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        self.get_mut().write(buf)
-    }
-
-    fn flush(&mut self) -> io::Result<()> {
-        self.get_mut().flush()
-    }
-}
-
-impl<R: BufRead> EncoderReaderBuf<R> {
-    /// Creates a new encoder which will use the given compression level.
-    ///
-    /// The encoder is not configured specially for the emitted header. For
-    /// header configuration, see the `Builder` type.
-    ///
-    /// The data read from the stream `r` will be compressed and available
-    /// through the returned reader.
-    pub fn new(r: R, level: Compression) -> EncoderReaderBuf<R> {
-        Builder::new().buf_read(r, level)
-    }
-
-    fn read_footer(&mut self, into: &mut [u8]) -> io::Result<usize> {
-        if self.pos == 8 {
-            return Ok(0);
-        }
-        let crc = self.inner.get_ref().crc();
-        let ref arr = [(crc.sum() >> 0) as u8,
-                       (crc.sum() >> 8) as u8,
-                       (crc.sum() >> 16) as u8,
-                       (crc.sum() >> 24) as u8,
-                       (crc.amount() >> 0) as u8,
-                       (crc.amount() >> 8) as u8,
-                       (crc.amount() >> 16) as u8,
-                       (crc.amount() >> 24) as u8];
-        Ok(copy(into, arr, &mut self.pos))
-    }
-}
-
-impl<R> EncoderReaderBuf<R> {
-    /// Acquires a reference to the underlying reader.
-    pub fn get_ref(&self) -> &R {
-        self.inner.get_ref().get_ref()
-    }
-
-    /// Acquires a mutable reference to the underlying reader.
-    ///
-    /// Note that mutation of the reader may result in surprising results if
-    /// this encoder is continued to be used.
-    pub fn get_mut(&mut self) -> &mut R {
-        self.inner.get_mut().get_mut()
-    }
-
-    /// Returns the underlying stream, consuming this encoder
-    pub fn into_inner(self) -> R {
-        self.inner.into_inner().into_inner()
-    }
-}
-
-impl<R: BufRead> Read for EncoderReaderBuf<R> {
-    fn read(&mut self, mut into: &mut [u8]) -> io::Result<usize> {
-        let mut amt = 0;
-        if self.eof {
-            return self.read_footer(into);
-        } else if self.pos < self.header.len() {
-            amt += copy(into, &self.header, &mut self.pos);
-            if amt == into.len() {
-                return Ok(amt);
-            }
-            let tmp = into;
-            into = &mut tmp[amt..];
-        }
-        match try!(self.inner.read(into)) {
-            0 => {
-                self.eof = true;
-                self.pos = 0;
-                self.read_footer(into)
-            }
-            n => Ok(amt + n),
-        }
-    }
-}
-
-impl<R: BufRead + Write> Write for EncoderReaderBuf<R> {
-    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        self.get_mut().write(buf)
-    }
-
-    fn flush(&mut self) -> io::Result<()> {
-        self.get_mut().flush()
-    }
-}
-
-impl<R: Read> DecoderReader<R> {
-    /// Creates a new decoder from the given reader, immediately parsing the
-    /// gzip header.
-    ///
-    /// # Errors
-    ///
-    /// If an error is encountered when parsing the gzip header, an error is
-    /// returned.
-    pub fn new(r: R) -> io::Result<DecoderReader<R>> {
-        DecoderReaderBuf::new(BufReader::new(r)).map(|r| {
-            DecoderReader { inner: r }
-        })
-    }
-}
-
-impl<R> DecoderReader<R> {
-    /// Returns the header associated with this stream.
-    pub fn header(&self) -> &Header {
-        self.inner.header()
-    }
-
-    /// Acquires a reference to the underlying reader.
-    pub fn get_ref(&self) -> &R {
-        self.inner.get_ref().get_ref()
-    }
-
-    /// Acquires a mutable reference to the underlying stream.
-    ///
-    /// Note that mutation of the stream may result in surprising results if
-    /// this encoder is continued to be used.
-    pub fn get_mut(&mut self) -> &mut R {
-        self.inner.get_mut().get_mut()
-    }
-
-    /// Consumes this decoder, returning the underlying reader.
-    pub fn into_inner(self) -> R {
-        self.inner.into_inner().into_inner()
-    }
-}
-
-impl<R: Read> Read for DecoderReader<R> {
-    fn read(&mut self, into: &mut [u8]) -> io::Result<usize> {
-        self.inner.read(into)
-    }
-}
-
-impl<R: Read + Write> Write for DecoderReader<R> {
-    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        self.get_mut().write(buf)
-    }
-
-    fn flush(&mut self) -> io::Result<()> {
-        self.get_mut().flush()
-    }
-}
-
-impl<R: Read> MultiDecoderReader<R> {
-    /// Creates a new decoder from the given reader, immediately parsing the
-    /// (first) gzip header. If the gzip stream contains multiple members all will
-    /// be decoded.
-    ///
-    /// # Errors
-    ///
-    /// If an error is encountered when parsing the gzip header, an error is
-    /// returned.
-    pub fn new(r: R) -> io::Result<MultiDecoderReader<R>> {
-        MultiDecoderReaderBuf::new(BufReader::new(r)).map(|r| {
-            MultiDecoderReader { inner: r }
-        })
-    }
-}
-
-impl<R> MultiDecoderReader<R> {
-    /// Returns the current header associated with this stream.
-    pub fn header(&self) -> &Header {
-        self.inner.header()
-    }
-
-    /// Acquires a reference to the underlying reader.
-    pub fn get_ref(&self) -> &R {
-        self.inner.get_ref().get_ref()
-    }
-
-    /// Acquires a mutable reference to the underlying stream.
-    ///
-    /// Note that mutation of the stream may result in surprising results if
-    /// this encoder is continued to be used.
-    pub fn get_mut(&mut self) -> &mut R {
-        self.inner.get_mut().get_mut()
-    }
-
-    /// Consumes this decoder, returning the underlying reader.
-    pub fn into_inner(self) -> R {
-        self.inner.into_inner().into_inner()
-    }
-}
-
-impl<R: Read> Read for MultiDecoderReader<R> {
-    fn read(&mut self, into: &mut [u8]) -> io::Result<usize> {
-        self.inner.read(into)
-    }
-}
-
-impl<R: Read + Write> Write for MultiDecoderReader<R> {
-    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        self.get_mut().write(buf)
-    }
-
-    fn flush(&mut self) -> io::Result<()> {
-        self.get_mut().flush()
-    }
-}
-
-impl<R: BufRead> DecoderReaderBuf<R> {
-    /// Creates a new decoder from the given reader, immediately parsing the
-    /// gzip header.
-    ///
-    /// # Errors
-    ///
-    /// If an error is encountered when parsing the gzip header, an error is
-    /// returned.
-    pub fn new(mut r: R) -> io::Result<DecoderReaderBuf<R>> {
-        let header = try!(read_gz_header(&mut r));
-
-        let flate = deflate::DecoderReaderBuf::new(r);
-        return Ok(DecoderReaderBuf {
-            inner: CrcReader::new(flate),
-            header: header,
-            finished: false,
-        });
-    }
-
-    fn finish(&mut self) -> io::Result<()> {
-        if self.finished {
-            return Ok(());
-        }
-        let ref mut buf = [0u8; 8];
-        {
-            let mut len = 0;
-
-            while len < buf.len() {
-                match try!(self.inner.get_mut().get_mut().read(&mut buf[len..])) {
-                    0 => return Err(corrupt()),
-                    n => len += n,
-                }
-            }
-        }
-
-        let crc = ((buf[0] as u32) << 0) | ((buf[1] as u32) << 8) |
-                  ((buf[2] as u32) << 16) |
-                  ((buf[3] as u32) << 24);
-        let amt = ((buf[4] as u32) << 0) | ((buf[5] as u32) << 8) |
-                  ((buf[6] as u32) << 16) |
-                  ((buf[7] as u32) << 24);
-        if crc != self.inner.crc().sum() as u32 {
-            return Err(corrupt());
-        }
-        if amt != self.inner.crc().amount() {
-            return Err(corrupt());
-        }
-        self.finished = true;
-        Ok(())
-    }
-}
-
-impl<R> DecoderReaderBuf<R> {
-    /// Returns the header associated with this stream.
-    pub fn header(&self) -> &Header {
-        &self.header
-    }
-
-    /// Acquires a reference to the underlying reader.
-    pub fn get_ref(&self) -> &R {
-        self.inner.get_ref().get_ref()
-    }
-
-    /// Acquires a mutable reference to the underlying stream.
-    ///
-    /// Note that mutation of the stream may result in surprising results if
-    /// this encoder is continued to be used.
-    pub fn get_mut(&mut self) -> &mut R {
-        self.inner.get_mut().get_mut()
-    }
-
-    /// Consumes this decoder, returning the underlying reader.
-    pub fn into_inner(self) -> R {
-        self.inner.into_inner().into_inner()
-    }
-}
-
-impl<R: BufRead> Read for DecoderReaderBuf<R> {
-    fn read(&mut self, into: &mut [u8]) -> io::Result<usize> {
-        match try!(self.inner.read(into)) {
-            0 => {
-                try!(self.finish());
-                Ok(0)
-            }
-            n => Ok(n),
-        }
-    }
-}
-
-impl<R: BufRead + Write> Write for DecoderReaderBuf<R> {
-    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        self.get_mut().write(buf)
-    }
-
-    fn flush(&mut self) -> io::Result<()> {
-        self.get_mut().flush()
-    }
-}
-
-impl<R: BufRead> MultiDecoderReaderBuf<R> {
-    /// Creates a new decoder from the given reader, immediately parsing the
-    /// (first) gzip header. If the gzip stream contains multiple members all will
-    /// be decoded.
-    ///
-    /// # Errors
-    ///
-    /// If an error is encountered when parsing the gzip header, an error is
-    /// returned.
-    pub fn new(mut r: R) -> io::Result<MultiDecoderReaderBuf<R>> {
-        let header = try!(read_gz_header(&mut r));
-
-        let flate = deflate::DecoderReaderBuf::new(r);
-        return Ok(MultiDecoderReaderBuf {
-            inner: CrcReader::new(flate),
-            header: header,
-            finished: false,
-        });
-    }
-
-    fn finish_member(&mut self) -> io::Result<usize> {
-        if self.finished {
-            return Ok(0);
-        }
-        let ref mut buf = [0u8; 8];
-        {
-            let mut len = 0;
-
-            while len < buf.len() {
-                match try!(self.inner.get_mut().get_mut().read(&mut buf[len..])) {
-                    0 => return Err(corrupt()),
-                    n => len += n,
-                }
-            }
-        }
-
-        let crc = ((buf[0] as u32) << 0) | ((buf[1] as u32) << 8) |
-                  ((buf[2] as u32) << 16) |
-                  ((buf[3] as u32) << 24);
-        let amt = ((buf[4] as u32) << 0) | ((buf[5] as u32) << 8) |
-                  ((buf[6] as u32) << 16) |
-                  ((buf[7] as u32) << 24);
-        if crc != self.inner.crc().sum() as u32 {
-            return Err(corrupt());
-        }
-        if amt != self.inner.crc().amount() {
-            return Err(corrupt());
-        }
-        let remaining = match self.inner.get_mut().get_mut().fill_buf() {
-            Ok(b) => {
-                if b.is_empty() {
-                    self.finished = true;
-                    return Ok(0);
-                } else {
-                    b.len()
-                }
-            },
-            Err(e) => return Err(e)
-        };
-
-        let next_header = try!(read_gz_header(self.inner.get_mut().get_mut()));
-        mem::replace(&mut self.header, next_header);
-        self.inner.reset();
-        self.inner.get_mut().reset_data();
-
-        Ok(remaining)
-    }
-}
-
-impl<R> MultiDecoderReaderBuf<R> {
-    /// Returns the current header associated with this stream.
-    pub fn header(&self) -> &Header {
-        &self.header
-    }
-
-    /// Acquires a reference to the underlying reader.
-    pub fn get_ref(&self) -> &R {
-        self.inner.get_ref().get_ref()
-    }
-
-    /// Acquires a mutable reference to the underlying stream.
-    ///
-    /// Note that mutation of the stream may result in surprising results if
-    /// this encoder is continued to be used.
-    pub fn get_mut(&mut self) -> &mut R {
-        self.inner.get_mut().get_mut()
-    }
-
-    /// Consumes this decoder, returning the underlying reader.
-    pub fn into_inner(self) -> R {
-        self.inner.into_inner().into_inner()
-    }
-}
-
-impl<R: BufRead> Read for MultiDecoderReaderBuf<R> {
-    fn read(&mut self, into: &mut [u8]) -> io::Result<usize> {
-        match try!(self.inner.read(into)) {
-            0 => {
-                match self.finish_member() {
-                    Ok(0) => Ok(0),
-                    Ok(_) => self.read(into),
-                    Err(e) => Err(e)
-                }
-            },
-            n => Ok(n),
-        }
-    }
-}
-
-impl<R: BufRead + Write> Write for MultiDecoderReaderBuf<R> {
-    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        self.get_mut().write(buf)
-    }
-
-    fn flush(&mut self) -> io::Result<()> {
-        self.get_mut().flush()
-    }
-}
-
 impl Header {
     /// Returns the `filename` field of this gzip stream's header, if present.
     pub fn filename(&self) -> Option<&[u8]> {
@@ -932,7 +228,7 @@ impl Header {
     }
 }
 
-fn corrupt() -> io::Error {
+pub fn corrupt() -> io::Error {
     io::Error::new(io::ErrorKind::InvalidInput,
                    "corrupt gzip stream does not have a matching checksum")
 }
@@ -947,7 +243,7 @@ fn read_le_u16<R: Read>(r: &mut R) -> io::Result<u16> {
     Ok((b[0] as u16) | ((b[1] as u16) << 8))
 }
 
-fn read_gz_header<R: Read>(r: &mut R) -> io::Result<Header> {
+pub fn read_gz_header<R: Read>(r: &mut R) -> io::Result<Header> {
     let mut crc_reader = CrcReader::new(r);
     let mut header = [0; 10];
     try!(crc_reader.read_exact(&mut header));
@@ -1020,115 +316,4 @@ fn read_gz_header<R: Read>(r: &mut R) -> io::Result<Header> {
         comment: comment,
         mtime: mtime,
     })
-}
-
-#[cfg(test)]
-mod tests {
-    use std::io::prelude::*;
-
-    use super::{EncoderWriter, EncoderReader, DecoderReader, Builder};
-    use Compression::Default;
-    use rand::{thread_rng, Rng};
-
-    #[test]
-    fn roundtrip() {
-        let mut e = EncoderWriter::new(Vec::new(), Default);
-        e.write_all(b"foo bar baz").unwrap();
-        let inner = e.finish().unwrap();
-        let mut d = DecoderReader::new(&inner[..]).unwrap();
-        let mut s = String::new();
-        d.read_to_string(&mut s).unwrap();
-        assert_eq!(s, "foo bar baz");
-    }
-
-    #[test]
-    fn roundtrip_zero() {
-        let e = EncoderWriter::new(Vec::new(), Default);
-        let inner = e.finish().unwrap();
-        let mut d = DecoderReader::new(&inner[..]).unwrap();
-        let mut s = String::new();
-        d.read_to_string(&mut s).unwrap();
-        assert_eq!(s, "");
-    }
-
-    #[test]
-    fn roundtrip_big() {
-        let mut real = Vec::new();
-        let mut w = EncoderWriter::new(Vec::new(), Default);
-        let v = thread_rng().gen_iter::<u8>().take(1024).collect::<Vec<_>>();
-        for _ in 0..200 {
-            let to_write = &v[..thread_rng().gen_range(0, v.len())];
-            real.extend(to_write.iter().map(|x| *x));
-            w.write_all(to_write).unwrap();
-        }
-        let result = w.finish().unwrap();
-        let mut r = DecoderReader::new(&result[..]).unwrap();
-        let mut v = Vec::new();
-        r.read_to_end(&mut v).unwrap();
-        assert!(v == real);
-    }
-
-    #[test]
-    fn roundtrip_big2() {
-        let v = thread_rng()
-                    .gen_iter::<u8>()
-                    .take(1024 * 1024)
-                    .collect::<Vec<_>>();
-        let mut r = DecoderReader::new(EncoderReader::new(&v[..], Default))
-                        .unwrap();
-        let mut res = Vec::new();
-        r.read_to_end(&mut res).unwrap();
-        assert!(res == v);
-    }
-
-    #[test]
-    fn fields() {
-        let r = vec![0, 2, 4, 6];
-        let e = Builder::new()
-                    .filename("foo.rs")
-                    .comment("bar")
-                    .extra(vec![0, 1, 2, 3])
-                    .read(&r[..], Default);
-        let mut d = DecoderReader::new(e).unwrap();
-        assert_eq!(d.header().filename(), Some(&b"foo.rs"[..]));
-        assert_eq!(d.header().comment(), Some(&b"bar"[..]));
-        assert_eq!(d.header().extra(), Some(&b"\x00\x01\x02\x03"[..]));
-        let mut res = Vec::new();
-        d.read_to_end(&mut res).unwrap();
-        assert_eq!(res, vec![0, 2, 4, 6]);
-
-    }
-
-    #[test]
-    fn keep_reading_after_end() {
-        let mut e = EncoderWriter::new(Vec::new(), Default);
-        e.write_all(b"foo bar baz").unwrap();
-        let inner = e.finish().unwrap();
-        let mut d = DecoderReader::new(&inner[..]).unwrap();
-        let mut s = String::new();
-        d.read_to_string(&mut s).unwrap();
-        assert_eq!(s, "foo bar baz");
-        d.read_to_string(&mut s).unwrap();
-        assert_eq!(s, "foo bar baz");
-    }
-
-    #[test]
-    fn qc_reader() {
-        ::quickcheck::quickcheck(test as fn(_) -> _);
-
-        fn test(v: Vec<u8>) -> bool {
-            let r = EncoderReader::new(&v[..], Default);
-            let mut r = DecoderReader::new(r).unwrap();
-            let mut v2 = Vec::new();
-            r.read_to_end(&mut v2).unwrap();
-            v == v2
-        }
-    }
-
-    #[test]
-    fn flush_after_write() {
-		let mut f = EncoderWriter::new(Vec::new(), Default);
-		write!(f, "Hello world").unwrap();
-		f.flush().unwrap();
-    }
 }
